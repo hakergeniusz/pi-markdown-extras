@@ -3,23 +3,28 @@
  *
  * Enhances chat markdown handling:
  * - GitHub-style alerts ([!NOTE], [!WARNING], [!IMPORTANT], [!TIP], [!CAUTION], etc.)
- *   rendered as companion cards.
- * - Heading outlines for #, ##, ###.
- * - Task checkboxes rendered as an interactive companion card (click to toggle boxes).
+ *   rendered as alert cards.
+ * - Tasks rendered inline, exactly where the model wrote them, using Pi's normal
+ *   `[ ]` / `[x]` markdown look. Click a task line to toggle it.
  *
- * Note: Pi extensions cannot replace the built-in assistant markdown renderer in-place.
- * Tasks become clickable in the rendered "Tasks" companion card; the original assistant
- * message text is not mutated.
+ * How the inline task interaction works:
+ * Pi's built-in assistant Markdown renderer cannot host mouse regions per line.
+ * When an assistant text block contains task items, this extension:
+ *   1. hides that block's default rendering with a display-only markdown transformer,
+ *   2. stores the block in a durable custom entry, and
+ *   3. re-renders the whole block with Pi's normal `Markdown` component (same layout,
+ *      headings, lists, code blocks) wrapped in a mouse region that toggles the task
+ *      line that was clicked.
+ * The session and the model context are not modified; only the chat display is.
  */
 
-import { Box, Container, MouseRegion, Text } from "@earendil-works/pi-tui";
-import type { Component } from "@earendil-works/pi-tui";
+import { Box, Container, Markdown, MouseRegion, Text, stripTerminalSequences } from "@earendil-works/pi-tui";
+import type { Component, MarkdownTheme } from "@earendil-works/pi-tui";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const ALERT_ENTRY = "md-alert";
-const OUTLINE_ENTRY = "md-outline";
-const TASKS_ENTRY = "md-tasks";
-const TASKS_STATE_TYPE = "md-tasks-state";
+const MESSAGE_ENTRY = "md-task-message";
+const TASK_STATE_ENTRY = "md-task-state";
 
 const ALERT_TYPES: Record<string, { label: string; icon: string }> = {
   NOTE: { label: "Note", icon: "ℹ" },
@@ -37,11 +42,16 @@ const ALERT_TYPES: Record<string, { label: string; icon: string }> = {
 };
 
 type AlertData = { type: string; label: string; icon: string; body: string };
-type OutlineData = { headings: Array<{ level: number; text: string }> };
-type Task = { index: number; checked: boolean; text: string };
-type TasksData = { tasks: Task[]; sourceHash: string };
 
+type TaskRef = { index: number; checked: boolean; text: string; line: number };
+type MessageData = { sourceHash: string; text: string; tasks: TaskRef[] };
+
+const hiddenHashes = new Set<string>();
 const taskState = new Map<string, Record<number, boolean>>();
+const seenAlerts = new Set<string>();
+
+const TASK_LINE = /^\s*(?:[-*+]|\d+[.)])\s+\[[ xX]\]/;
+const TASK_LINE_PARTS = /^(\s*(?:[-*+]|\d+[.)])\s+)\[([ xX])\]\s+(.*)$/;
 
 function notify(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error" = "info") {
   try { ctx.ui.notify(message, level); } catch {}
@@ -49,22 +59,6 @@ function notify(ctx: ExtensionContext, message: string, level: "info" | "warning
 
 function getBranch(ctx: ExtensionContext): any[] {
   try { return (ctx.sessionManager.getBranch() as any[]) || []; } catch { return []; }
-}
-
-function messageText(message: any): string {
-  const content = message?.content;
-  if (typeof content === "string") return content;
-  if (Array.isArray(content)) return content.filter((c: any) => c?.type === "text").map((c: any) => c.text || "").join("\n\n");
-  return "";
-}
-
-function lastAssistantText(ctx: ExtensionContext): string {
-  const branch = getBranch(ctx);
-  for (let i = branch.length - 1; i >= 0; i--) {
-    const e = branch[i];
-    if (e?.type === "message" && e?.message?.role === "assistant") return messageText(e.message);
-  }
-  return "";
 }
 
 function hashText(s: string): string {
@@ -97,46 +91,78 @@ function parseAlerts(text: string): AlertData[] {
   return out;
 }
 
-function parseHeadings(text: string): OutlineData["headings"] {
-  const headings: OutlineData["headings"] = [];
-  let inFence = false;
-  for (const line of text.split(/\r?\n/)) {
-    if (/^\s*```/.test(line)) { inFence = !inFence; continue; }
-    if (inFence) continue;
-    const m = line.match(/^(#{1,3})\s+(.+?)\s*#*\s*$/);
-    if (m) headings.push({ level: m[1].length, text: m[2].trim() });
-  }
-  return headings;
+function isFence(line: string): boolean {
+  return /^\s*(```|~~~)/.test(line);
 }
 
-function parseTasks(text: string): Task[] {
-  const tasks: Task[] = [];
+/** Parse task items with their source line number. Lines inside code fences are ignored. */
+function parseTasks(text: string): TaskRef[] {
+  const lines = text.split(/\r?\n/);
+  const tasks: TaskRef[] = [];
   let inFence = false;
-  let idx = 0;
-  for (const line of text.split(/\r?\n/)) {
-    if (/^\s*```/.test(line)) { inFence = !inFence; continue; }
-    if (inFence) continue;
-    const m = line.match(/^(\s*[-*+]\s*)\[([ xX])\]\s+(.*)$/);
-    if (m) {
-      idx++;
-      tasks.push({ index: idx, checked: m[2].toLowerCase() === "x", text: m[3].trim() });
+  let index = 0;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (isFence(line)) {
+      inFence = !inFence;
+      continue;
     }
+    if (inFence) continue;
+    const m = line.match(TASK_LINE_PARTS);
+    if (!m) continue;
+    index++;
+    tasks.push({ index, checked: m[2].toLowerCase() === "x", text: m[3].trim(), line: i });
   }
   return tasks;
 }
 
-function effectiveChecked(sourceHash: string, task: Task): boolean {
-  const o = taskState.get(sourceHash);
-  if (o && Object.prototype.hasOwnProperty.call(o, task.index)) return !!o[task.index];
+function effectiveChecked(sourceHash: string, task: Pick<TaskRef, "index" | "checked">): boolean {
+  const overrides = taskState.get(sourceHash);
+  if (overrides && Object.prototype.hasOwnProperty.call(overrides, task.index)) return !!overrides[task.index];
   return task.checked;
 }
 
-function toggleTask(pi: ExtensionAPI, ctx: ExtensionContext, sourceHash: string, task: Task) {
-  const current = effectiveChecked(sourceHash, task);
-  const next = { ...(taskState.get(sourceHash) || {}), [task.index]: !current };
+function setTaskMarker(line: string, checked: boolean): string {
+  return line.replace(/^(\s*(?:[-*+]|\d+[.)])\s+)\[([ xX])\]/, (_m, prefix: string) => `${prefix}[${checked ? "x" : " "}]`);
+}
+
+/** Apply current toggle state to the source text, preserving every other character. */
+function applyTaskStates(data: MessageData): string {
+  const tasks = Array.isArray(data.tasks) ? data.tasks : [];
+  if (tasks.length === 0) return data.text;
+  const lines = data.text.split(/\r?\n/);
+  for (const task of tasks) {
+    if (task.line < 0 || task.line >= lines.length) continue;
+    lines[task.line] = setTaskMarker(lines[task.line], effectiveChecked(data.sourceHash, task));
+  }
+  return lines.join("\n");
+}
+
+function toggleTask(pi: ExtensionAPI, sourceHash: string, task: Pick<TaskRef, "index" | "checked">, currentChecked: boolean) {
+  const next = { ...(taskState.get(sourceHash) || {}), [task.index]: !currentChecked };
   taskState.set(sourceHash, next);
-  try { pi.appendEntry(TASKS_STATE_TYPE, { sourceHash, overrides: next, at: new Date().toISOString() }); } catch {}
-  try { ctx.ui.requestRender?.(); } catch {}
+  try {
+    pi.appendEntry(TASK_STATE_ENTRY, { sourceHash, overrides: next, at: new Date().toISOString() });
+  } catch {}
+}
+
+function markdownTheme(theme: any): MarkdownTheme {
+  return {
+    heading: (text: string) => theme.fg("mdHeading", text),
+    link: (text: string) => theme.fg("mdLink", text),
+    linkUrl: (text: string) => theme.fg("mdLinkUrl", text),
+    code: (text: string) => theme.fg("mdCode", text),
+    codeBlock: (text: string) => theme.fg("mdCodeBlock", text),
+    codeBlockBorder: (text: string) => theme.fg("mdCodeBlockBorder", text),
+    quote: (text: string) => theme.fg("mdQuote", text),
+    quoteBorder: (text: string) => theme.fg("mdQuoteBorder", text),
+    hr: (text: string) => theme.fg("mdHr", text),
+    listBullet: (text: string) => theme.fg("mdListBullet", text),
+    bold: (text: string) => theme.bold(text),
+    italic: (text: string) => theme.italic(text),
+    underline: (text: string) => theme.underline(text),
+    strikethrough: (text: string) => theme.strikethrough(text),
+  };
 }
 
 function renderAlert(entry: any, theme: any): Component {
@@ -147,114 +173,182 @@ function renderAlert(entry: any, theme: any): Component {
   return box;
 }
 
-function renderOutline(entry: any, theme: any): Component {
-  const d = (entry?.data || {}) as Partial<OutlineData>;
-  const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
-  box.addChild(new Text(theme.fg("accent", "§ Heading outline"), 0, 0));
-  for (const h of d.headings || []) {
-    const indent = "  ".repeat(Math.max(0, h.level - 1));
-    box.addChild(new Text(`  ${indent}${"#".repeat(h.level)} ${h.text}`, 0, 0));
+/** Return the 1-based task number when the rendered line is a task marker line. */
+function taskAtRenderedLine(markdown: Markdown, width: number, y: number): number | null {
+  const lines = markdown.render(width);
+  if (y < 0 || y >= lines.length) return null;
+  const plain = (line: string) => stripTerminalSequences(line);
+  if (!TASK_LINE.test(plain(lines[y]))) return null;
+  let count = 0;
+  for (let i = 0; i <= y; i++) {
+    if (TASK_LINE.test(plain(lines[i]))) count++;
   }
-  return box;
+  return count || null;
 }
 
-function renderTasks(pi: ExtensionAPI, ctx: ExtensionContext, entry: any, theme: any): Component {
-  const d = (entry?.data || {}) as Partial<TasksData>;
-  const tasks = (d.tasks || []) as Task[];
-  const sourceHash = String(d.sourceHash || "");
-  const box = new Box(1, 1, (t: string) => theme.bg("customMessageBg", t));
-  box.addChild(new Text(theme.fg("accent", "☑ Tasks (click a box to toggle)"), 0, 0));
-  for (const task of tasks.slice(0, 60)) {
-    const checked = effectiveChecked(sourceHash, task);
-    const mark = checked ? "☑" : "☐";
-    const row = new Text(`  ${mark} ${task.text}`, 0, 0);
-    // Wrap row in a mouse region so clicks toggle this task in supported UIs.
-    box.addChild(new MouseRegion(row, (event: any) => {
-      if (event?.type === "click" && (!event.button || event.button === "left")) {
-        toggleTask(pi, ctx, sourceHash, task);
-        return { handled: true, render: true };
-      }
-      return undefined;
-    }));
+/**
+ * Entry component that renders a whole assistant text block in the normal
+ * markdown style through one Markdown component, so headings, lists, spacing
+ * and code blocks look exactly like Pi's default rendering. A click on a task
+ * marker line toggles that item.
+ */
+class TaskMessageView extends Container {
+  constructor(private pi: ExtensionAPI, private data: MessageData, private theme: any) {
+    super();
   }
-  box.addChild(new Text(theme.fg("dim", "  (Toggles this card; original assistant message is not mutated. /tasks markdown exports.)"), 0, 0));
-  return box;
+
+  render(width: number): string[] {
+    this.clear();
+    const mdTheme = markdownTheme(this.theme);
+    const markdown = new Markdown(applyTaskStates(this.data), 1, 0, mdTheme);
+    const sourceHash = String(this.data.sourceHash || "");
+
+    this.addChild(new MouseRegion(markdown, (event: any) => {
+      if (event?.type !== "click" || event?.button !== "left") return undefined;
+      const index = taskAtRenderedLine(markdown, event.width || width, event.y);
+      if (!index) return undefined;
+      const task = (this.data.tasks || []).find((t) => t.index === index);
+      if (!task) return undefined;
+      toggleTask(this.pi, sourceHash, task, effectiveChecked(sourceHash, task));
+      return { handled: true, render: true };
+    }));
+
+    return super.render(width);
+  }
+}
+
+function lastAssistantTaskBlock(ctx: ExtensionContext): { text: string; tasks: TaskRef[]; sourceHash: string } | null {
+  const branch = getBranch(ctx);
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const entry = branch[i];
+    if (entry?.type !== "message" || entry?.message?.role !== "assistant") continue;
+    const content = entry.message.content;
+    if (!Array.isArray(content)) return null;
+    for (let j = content.length - 1; j >= 0; j--) {
+      const block = content[j];
+      if (block?.type !== "text") continue;
+      const text = String(block.text || "").trim();
+      if (!text) continue;
+      const tasks = parseTasks(text);
+      if (tasks.length > 0) return { text, tasks, sourceHash: hashText(text) };
+    }
+    return null;
+  }
+  return null;
 }
 
 export default function markdownExtras(pi: ExtensionAPI) {
-  const seen = new Set<string>();
+  pi.registerEntryRenderer<AlertData>(ALERT_ENTRY, (entry, _options, theme) => renderAlert(entry, theme));
+  pi.registerEntryRenderer<MessageData>(MESSAGE_ENTRY, (entry, _options, theme) => {
+    const data = (entry?.data || { sourceHash: "", text: "", tasks: [] }) as MessageData;
+    return new TaskMessageView(pi, data, theme);
+  });
 
-  pi.registerEntryRenderer<AlertData>(ALERT_ENTRY, (entry, _ctx, theme) => renderAlert(entry, theme));
-  pi.registerEntryRenderer<OutlineData>(OUTLINE_ENTRY, (entry, _ctx, theme) => renderOutline(entry, theme));
-  pi.registerEntryRenderer<TasksData>(TASKS_ENTRY, (entry, ctx, theme) => renderTasks(pi, ctx as ExtensionContext, entry, theme));
+  // Hide the default rendering of blocks that TaskMessageView re-renders with
+  // clickable task lines. Display-only: the session and model context stay intact.
+  pi.registerMarkdownTransformer((markdown, context) => {
+    if (context.messageType !== "assistant") return markdown;
+    return hiddenHashes.has(hashText(markdown.trim())) ? "" : markdown;
+  });
 
   pi.on("session_start", (_event, ctx) => {
-    seen.clear();
+    hiddenHashes.clear();
     taskState.clear();
+    seenAlerts.clear();
     try {
-      for (const e of getBranch(ctx)) {
-        if (e?.type === "custom" && e?.customType === TASKS_STATE_TYPE) {
-          const d = e.data as any;
-          if (d?.sourceHash) taskState.set(String(d.sourceHash), d.overrides || {});
+      for (const entry of getBranch(ctx)) {
+        if (entry?.type !== "custom") continue;
+        const data = entry.data as any;
+        if (entry.customType === TASK_STATE_ENTRY && data?.sourceHash) {
+          taskState.set(String(data.sourceHash), data.overrides || {});
+        } else if (entry.customType === MESSAGE_ENTRY && data?.sourceHash) {
+          hiddenHashes.add(String(data.sourceHash));
         }
       }
     } catch {}
   });
 
-  function processAssistantText(text: string) {
-    const key = hashText(text);
-    if (!text || seen.has(key)) return;
-    seen.add(key);
-    for (const alert of parseAlerts(text)) pi.appendEntry<AlertData>(ALERT_ENTRY, alert);
-    const headings = parseHeadings(text);
-    if (headings.length >= 2) pi.appendEntry<OutlineData>(OUTLINE_ENTRY, { headings });
-    const tasks = parseTasks(text);
-    if (tasks.length > 0) pi.appendEntry<TasksData>(TASKS_ENTRY, { tasks, sourceHash: key });
+  function processAlerts(text: string) {
+    for (const alert of parseAlerts(text)) {
+      const key = hashText(`${alert.type}\n${alert.body}\n${text.slice(0, 400)}`);
+      if (seenAlerts.has(key)) continue;
+      seenAlerts.add(key);
+      pi.appendEntry<AlertData>(ALERT_ENTRY, alert);
+    }
+  }
+
+  function processTextBlock(text: string, force: boolean) {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    const tasks = parseTasks(trimmed);
+    if (tasks.length > 0) {
+      const sourceHash = hashText(trimmed);
+      if (force || !hiddenHashes.has(sourceHash)) {
+        hiddenHashes.add(sourceHash);
+        pi.appendEntry<MessageData>(MESSAGE_ENTRY, { sourceHash, text: trimmed, tasks });
+      }
+    }
+    processAlerts(trimmed);
   }
 
   pi.on("message_end", async (event) => {
     try {
       if (event.message?.role !== "assistant") return;
-      processAssistantText(messageText(event.message));
+      const content = (event.message as any).content;
+      if (!Array.isArray(content)) return;
+      for (const block of content) {
+        if (block?.type === "text" && typeof block.text === "string") processTextBlock(block.text, true);
+      }
     } catch {}
   });
 
   pi.registerCommand("tasks", {
-    description: "Tasks from last assistant message: list | toggle <n> | markdown",
+    description: "Tasks in the last assistant message: list | toggle <n> | markdown",
     handler: async (args, ctx) => {
       const parts = (args || "").trim().split(/\s+/).filter(Boolean);
       const sub = (parts[0] || "list").toLowerCase();
-      const text = lastAssistantText(ctx);
-      const tasks = parseTasks(text);
-      if (tasks.length === 0) { notify(ctx, "No task checkboxes found in last assistant response.", "warning"); return; }
-      const sourceHash = hashText(text);
+      const block = lastAssistantTaskBlock(ctx);
+      if (!block) { notify(ctx, "No task checkboxes found in the last assistant message.", "warning"); return; }
+
+      const current = block.tasks.map((task) => ({ ...task, checked: effectiveChecked(block.sourceHash, task) }));
+
       if (sub === "toggle") {
         const n = Number(parts[1]);
-        const task = tasks.find((t) => t.index === n);
+        const task = current.find((t) => t.index === n);
         if (!task) { notify(ctx, `Task ${n} not found. Use /tasks list.`, "warning"); return; }
-        toggleTask(pi, ctx, sourceHash, task);
-        pi.appendEntry<TasksData>(TASKS_ENTRY, { tasks, sourceHash });
+        toggleTask(pi, block.sourceHash, task, task.checked);
         notify(ctx, `Toggled task ${n}.`, "info");
         return;
       }
+
       if (sub === "markdown") {
-        const md = tasks.map((t) => `- [${effectiveChecked(sourceHash, t) ? "x" : " "}] ${t.text}`).join("\n");
-        notify(ctx, md, "info");
+        const markdown = current.map((t) => `- [${t.checked ? "x" : " "}] ${t.text}`).join("\n");
+        notify(ctx, markdown, "info");
         return;
       }
-      pi.appendEntry<TasksData>(TASKS_ENTRY, { tasks, sourceHash });
-      notify(ctx, "Tasks card shown. Click boxes in supported UIs, or use /tasks toggle <n>.", "info");
+
+      const lines = current.map((t) => `  ${t.index}. [${t.checked ? "x" : " "}] ${t.text}`).join("\n");
+      notify(ctx, `Tasks:\n${lines}\n\n/tasks toggle <n> | /tasks markdown`, "info");
     },
   });
 
   pi.registerCommand("mdextras", {
-    description: "Rescan last assistant response for alerts/headings/tasks",
+    description: "Rescan the last assistant response for alerts/tasks",
     handler: async (_args, ctx) => {
-      const text = lastAssistantText(ctx);
-      if (!text) { notify(ctx, "No assistant response found.", "warning"); return; }
-      seen.delete(hashText(text));
-      processAssistantText(text);
-      notify(ctx, "Scanned last assistant response.", "info");
+      const block = lastAssistantTaskBlock(ctx);
+      if (!block) { notify(ctx, "No task checkboxes found in the last assistant message.", "warning"); return; }
+      const branch = getBranch(ctx);
+      for (let i = branch.length - 1; i >= 0; i--) {
+        const entry = branch[i];
+        if (entry?.type !== "message" || entry?.message?.role !== "assistant") continue;
+        const content = entry.message.content;
+        if (!Array.isArray(content)) break;
+        for (const b of content) {
+          if (b?.type === "text" && typeof b.text === "string") processTextBlock(b.text, false);
+        }
+        break;
+      }
+      notify(ctx, "Scanned the last assistant response.", "info");
     },
   });
 }

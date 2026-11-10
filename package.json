@@ -1,13 +1,26 @@
 {
   "name": "pi-markdown-extras",
-  "version": "0.1.0",
-  "description": "Pi extension: GitHub-style markdown alerts, heading outlines, and task checkbox helpers for chat messages",
+  "version": "0.2.0",
+  "description": "Pi extension: GitHub-style markdown alerts, inline clickable task checkboxes, and normal heading rendering",
   "type": "module",
   "license": "MIT",
-  "keywords": ["pi", "pi-package", "markdown", "alerts", "tasks", "headings"],
+  "keywords": [
+    "pi",
+    "pi-package",
+    "markdown",
+    "alerts",
+    "tasks",
+    "headings"
+  ],
   "main": "./index.ts",
-  "pi": { "extensions": ["./index.ts"] },
-  "engines": { "node": ">=22.0.0" },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
